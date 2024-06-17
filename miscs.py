@@ -55,6 +55,10 @@ def process_notes(db, notes, user_id):
             recipe_data['steps'] = json.loads(recipe_data['steps'])
             note.update(recipe_data)
 
+        elif note['type'] == 'video_recipe':
+            video_recipe_data = db.get_video_recipe_info(note['note_id'])
+            note.update(video_recipe_data)
+
     return notes
 
 
@@ -66,7 +70,10 @@ def process_recipe(recipe_form):
     ingredient_amounts = recipe_form.getlist('ingredient_amount')
 
     step_titles = recipe_form.getlist('step_title')
-    step_durations = recipe_form.getlist('step_duration')
+    step_time_amounts = recipe_form.getlist('timeAmount')
+    step_time_units = recipe_form.getlist('unit_text')
+    step_durations = [f'{num} {unit}' for num,
+                      unit in zip(step_time_amounts, step_time_units)]
     step_descriptions = recipe_form.getlist('step_description')
 
     for name, amount in zip(ingredient_names, ingredient_amounts):

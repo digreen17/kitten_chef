@@ -8,12 +8,13 @@ from miscs import convert_datetime_in_feed, \
     process_notes
 from forms import AddFriendForm, \
     UserSettingsForm, RegisterForm, LoginForm, \
-    PasswordRecoveryForm, AddPostForm
+    PasswordRecoveryForm, AddPostForm, ChangePasswordForm
 
 from flask import Flask, request, render_template, \
     redirect, send_from_directory, url_for, flash, \
     jsonify, abort
 from flask_mail import Mail, Message
+from flask_caching import Cache
 from flask_login import LoginManager, login_user, \
     logout_user, login_required, current_user
 from flask_socketio import SocketIO, emit, \
@@ -22,25 +23,22 @@ from werkzeug.security import generate_password_hash, \
     check_password_hash
 from werkzeug.utils import secure_filename
 
-# from yookassa import Configuration, Payment
-
 application = Flask(__name__)
 application.config.from_object('config')
 application.jinja_env.globals.update(
     convert_datetime_in_feed=convert_datetime_in_feed,
     convert_datetime_in_chat=convert_datetime_in_chat
 )
+
+cache = Cache(application)
 socketio = SocketIO(application)
 login_manager = LoginManager(application)
 mail = Mail(application)
 db = DbConnection(application)
 
-# Configuration.account_id = application.config['SHOP_ID']
-# Configuration.secret_key = application.config['SHOP_SECRET_KEY']
-
 
 @login_manager.user_loader
-def load_user(user_id):
+def load_user(user_id: int):
     user_data = db.get_user_by_id(user_id)
     return User(user_data)
 
@@ -74,13 +72,24 @@ def register():
 
         username = register_form.username.data
         email = register_form.email.data
+        user_data = db.get_user_by_email(email)
+
+        if db.check_busy_nickname(username):
+            flash('Пользователь с таким логином уже существует!',
+                  category='error')
+            return redirect(url_for('register'))
+
+        if user_data:
+            flash('Пользователь с такой почтой уже существует!',
+                  category='error')
+            return redirect(url_for('register'))
+
         password_hash = generate_password_hash(register_form.password.data)
         db.add_user((username, email, password_hash))
-
         html_body = render_template('welcome_mail.html', username=username)
         msg = Message('Добро пожаловать!', recipients=[email], html=html_body)
         mail.send(msg)
-
+        cache.delete('view/%s' % url_for('feed'))
         return redirect(url_for('login'))
 
     return render_template('register.html', register_form=register_form)
@@ -97,6 +106,7 @@ def login():
                                              login_form.password.data):
             userlogin = User(user_data)
             login_user(userlogin)
+            cache.delete('view/%s' % url_for('feed'))
             return redirect(url_for('feed'))
 
         flash('Ошибка авторизации!', category='error')
@@ -114,7 +124,6 @@ def password_recovery():
 
         if user_data:
             new_password = generate_random_password()
-
             username = user_data['username']
 
             html_body = render_template(
@@ -175,21 +184,39 @@ def handle_send_message(data):
     sent_at = current_time()
     db.add_message((sender_id, receiver_id, content, sent_at))
     data['sent_at'] = convert_datetime_in_chat(sent_at)
+    data['sender_avatar'] = current_user.profile_picture
+
+    cache_key = f'messages_{current_user.id}'
+    cache.delete(cache_key)
+
+    cache_key_receiver = f'messages_{receiver_id}'
+    cache.delete(cache_key_receiver)
+
     emit('message', {**data}, room=data['room'])
 
 
 @application.route('/messages')
 @login_required
+@cache.cached(timeout=300, key_prefix=lambda: f'messages_{current_user.id}')
 def messages():
     chats = db.get_chats_for_user_by_id(current_user.id)
-    print(chats)
     return render_template('messages.html', chats=chats)
 
 
 @application.route('/messages/<string:chat_username>', methods=['GET', 'POST'])
 @login_required
 def chat(chat_username):
-    chat_user_info = db.get_user_by_username(chat_username)
+    cache_key = f"chat_{current_user.username}:{chat_username}"
+    chat_user_info = cache.get(cache_key)
+
+    if not chat_user_info:
+        chat_user_info = db.get_user_by_username(chat_username)
+
+        if not chat_user_info:
+            abort(404)
+
+        cache.set(cache_key, chat_user_info, timeout=300)
+
     chat_user_id = chat_user_info['user_id']
     return render_template('chat.html', chat_username=chat_username,
                            chat_user_id=chat_user_id)
@@ -201,6 +228,8 @@ def settings():
     user_settings_form = UserSettingsForm()
 
     if user_settings_form.validate_on_submit():
+        cache_key = f'user_profile_{current_user.username}'
+
         user_id = current_user.id
         user_username = user_settings_form.username.data
         user_email = user_settings_form.email.data
@@ -224,10 +253,39 @@ def settings():
             user_profile_picture.save(os.path.join(avatar_path, filename))
             db.update_user_profile_picture(user_id, f'{user_id}/{filename}')
 
+        cache.delete(cache_key)
+
         return redirect(url_for('settings'))
 
     return render_template('settings.html',
                            user_settings_form=user_settings_form)
+
+
+@application.route('/change_password', methods=['GET', 'POST'])
+@login_required
+def change_password():
+    change_password_form = ChangePasswordForm()
+
+    if change_password_form.validate_on_submit():
+        old_password = change_password_form.old_password.data
+        new_password = change_password_form.new_password.data
+        confirm_new_password = change_password_form.confirm_new_password.data
+        user_data = db.get_user_by_id(current_user.id)
+
+        if not check_password_hash(user_data['password_hash'], old_password):
+            flash('Старый пароль неверен!', category='error')
+            return redirect(url_for('change_password'))
+
+        if new_password != confirm_new_password:
+            flash('Пароли должны совпадать!', category='error')
+            return redirect(url_for('change_password'))
+
+        new_password_hash = generate_password_hash(new_password)
+        db.update_user_password(user_data['email'], new_password_hash)
+        return redirect(url_for('login'))
+
+    return render_template('change_password.html',
+                           change_password_form=change_password_form)
 
 
 @application.route('/add_post', methods=['GET', 'POST'])
@@ -239,7 +297,18 @@ def add_post():
         user_id = current_user.id
         content = add_post_form.content.data
         note_id = db.add_note(user_id, 'post')
-        db.add_post_detail(note_id, content)
+
+        image_path = 'None'
+        if add_post_form.images.data:
+            image_file = add_post_form.images.data
+            filename = secure_filename(image_file.filename)
+            image_path = os.path.join(
+                application.config['UPLOAD_FOLDER'], filename)
+            image_file.save(image_path)
+            image_path = filename
+
+        db.add_post_detail(note_id, content, image_path)
+        cache.delete('view/%s' % url_for('feed'))
         return redirect(url_for('feed'))
 
     return render_template('add_post.html', add_post_form=add_post_form)
@@ -252,11 +321,49 @@ def add_recipe():
         recipe_name = request.form['recipe_name']
         ingredients, steps = process_recipe(request.form)
         user_id = current_user.id
+
+        print(request.form)
+
+        image_path = 'None'
+        if request.files['recipe_image']:
+            image_file = request.files['recipe_image']
+            filename = secure_filename(image_file.filename)
+            image_path = os.path.join(
+                application.config['UPLOAD_FOLDER'], filename)
+            image_file.save(image_path)
+            image_path = filename
+
         note_id = db.add_note(user_id, 'recipe')
-        db.add_recipe_detail(note_id, recipe_name, ingredients, steps)
+        db.add_recipe_detail(note_id, recipe_name,
+                             ingredients, steps, image_path)
+        cache.delete('view/%s' % url_for('feed'))
         return redirect(url_for('feed'))
 
     return render_template('add_recipe.html')
+
+
+@application.route('/add_video_recipe', methods=['GET', 'POST'])
+@login_required
+def add_video_recipe():
+    if request.method == 'POST':
+        recipe_name = request.form['recipe_name']
+        video_file = request.files['recipe_video']
+
+        filename = secure_filename(video_file.filename)
+        video_path = os.path.join(
+            application.config['UPLOAD_FOLDER'], filename)
+        video_file.save(video_path)
+
+        video_path = filename
+
+        user_id = current_user.id
+        note_id = db.add_note(user_id, 'video_recipe')
+        db.add_video_recipe_detail(note_id, recipe_name, video_path)
+        cache.delete('view/%s' % url_for('feed'))
+
+        return redirect(url_for('feed'))
+
+    return render_template('add_video_recipe.html')
 
 
 @application.route('/friends', methods=['GET', 'POST'])
@@ -295,10 +402,12 @@ def like_post():
 
     if db.has_like(user_id, note_id):
         db.remove_like(user_id, note_id)
+        cache.delete('view/%s' % url_for('feed'))
         return jsonify({'status': 'like removed'})
 
     else:
         db.add_like(user_id, note_id)
+        cache.delete('view/%s' % url_for('feed'))
         return jsonify({'status': 'like added'})
 
 
@@ -309,10 +418,12 @@ def favorite_post():
 
     if db.has_favorite(user_id, note_id):
         db.remove_favorite(user_id, note_id)
+        cache.delete('view/%s' % url_for('feed'))
         return jsonify({'status': 'favorite removed'})
 
     else:
         db.add_favorite(user_id, note_id)
+        cache.delete('view/%s' % url_for('feed'))
         return jsonify({'status': 'favorite added'})
 
 
@@ -339,11 +450,11 @@ def get_comments(note_id):
 
 @application.route('/feed', methods=['GET', 'POST'])
 @login_required
+@cache.cached(timeout=60)
 def feed():
     user_id = current_user.id
     notes = db.get_notes()
     notes = process_notes(db, notes, user_id)
-
     return render_template('feed.html', notes=notes)
 
 
@@ -352,8 +463,8 @@ def feed():
 def likes():
     user_id = current_user.id
     liked_notes = db.get_notes(user_id=user_id, likes=True)
+    print(liked_notes)
     notes = process_notes(db, liked_notes, user_id)
-
     return render_template('likes.html', notes=notes)
 
 
@@ -369,16 +480,22 @@ def favorites():
 @application.route('/user/<string:username>', methods=['GET', 'POST'])
 @login_required
 def user_profile(username):
-    add_friend_form = AddFriendForm()
-    user_info = db.get_user_by_username(username)
+    cache_key = f'user_profile_{username}'
+    user_info = cache.get(cache_key)
 
     if not user_info:
-        abort(404)
+        user_info = db.get_user_by_username(username)
 
+        if not user_info:
+            abort(404)
+
+        cache.set(cache_key, user_info, timeout=300)
+
+    add_friend_form = AddFriendForm()
     user_id = current_user.id
     friend_id = user_info['user_id']
     notes = db.get_notes(user_id=friend_id, notes=True)
-    notes = process_notes(db, notes, friend_id)
+    notes = process_notes(db, notes, user_id)
 
     friendship_status = db.check_friendship_status(user_id, friend_id)
 
@@ -394,6 +511,8 @@ def user_profile(username):
 
         if friendship_status in ['pending', 'accepted']:
             db.delete_friend(user_id, friend_id)
+
+        cache.delete(cache_key)
 
         return redirect(url_for('user_profile', username=username))
 
